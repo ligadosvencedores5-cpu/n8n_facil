@@ -430,7 +430,9 @@ def n8n(metodo: str, caminho: str, corpo=None, params=None, url: str = None, cha
         r = requests.request(metodo, f"{base}/api/v1{caminho}", json=corpo, params=params, timeout=45,
                              headers={"X-N8N-API-KEY": chave, "Accept": "application/json"})
     except requests.RequestException as e:
-        raise ErroAPI(f"Não consegui falar com o seu n8n ({e.__class__.__name__}). Ele está ligado? Veja a aba 🛠️ Servidor.")
+        raise ErroAPI(f"Não consegui falar com o seu n8n ({e.__class__.__name__}). Confira: 1) o n8n já foi instalado e está ligado "
+                      f"(aba 🚀 Instalar n8n → Verificar se já ligou); 2) o endereço é o do SEU n8n (termina com .up.railway.app), "
+                      f"e não o painel do Railway.")
     if r.status_code == 401:
         raise ErroAPI("🔑 O n8n recusou a chave da API. Crie uma nova em Settings → n8n API e cole na aba 🔑 Conectar n8n.")
     if r.status_code == 403:
@@ -2010,6 +2012,10 @@ with abas[1]:
 # ══════════════════════════════════════════════════════════════════════════
 with abas[2]:
     st.markdown("### 🔑 Conectar o app ao seu n8n")
+    if not (S.n8n_url or S.rw.get("domain")):
+        st.info("👉 **Este passo vem depois da instalação.** Primeiro instale o n8n na aba **🚀 Instalar n8n**: o app cria o seu endereço "
+                "(algo como **n8n-seunome-production.up.railway.app**) e já preenche aqui. Se você já tem um n8n em outro lugar, "
+                "cole o endereço dele abaixo.")
     url_sug = S.n8n_url or (f"https://{S.rw['domain']}" if S.rw.get("domain") else "")
     if url_sug:
         st.markdown(f"**1.** Abra seu n8n: [{url_sug}]({url_sug}) — na primeira vez, **crie o usuário dono** (e-mail e senha).")
@@ -2025,6 +2031,9 @@ Dê um nome (ex.: *n8n Facil*), escolha **No expiration** e clique em **Save**. 
     if st.button("🔌 Conectar e testar", type="primary", key="b_con_n8n"):
         if not url_in.strip() or len(key_in.strip()) < 10:
             st.warning("Preencha o endereço e a chave.")
+        elif re.search(r"(^|//|\.)railway\.(com|app)(/|$)", url_in.strip()) and ".up.railway.app" not in url_in:
+            st.warning("Esse é o endereço do **painel do Railway**, não do seu n8n. O endereço do n8n termina com **.up.railway.app** "
+                       "e aparece na aba 🚀 Instalar n8n depois da instalação.")
         else:
             with st.spinner("Testando a conexão…"):
                 ok = rodar(n8n, "GET", "/workflows", None, {"limit": 1}, url_in, key_in)
