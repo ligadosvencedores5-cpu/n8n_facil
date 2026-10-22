@@ -47,6 +47,7 @@ CATEGORIAS = {
     "planilha": ("📊", "Planilhas e e-mail"),
     "conteudo": ("📣", "Redes sociais e conteúdo"),
     "vendas":  ("💰", "Vendas e pagamentos"),
+    "afiliado": ("💸", "Divulgar meu link de afiliado"),
 }
 FUSOS = ["America/Sao_Paulo", "America/Manaus", "America/Cuiaba", "America/Belem", "America/Fortaleza", "America/Recife",
          "America/Bahia", "America/Porto_Velho", "America/Rio_Branco", "America/Noronha", "Europe/Lisbon", "UTC"]
@@ -117,13 +118,18 @@ PADRAO = {
     "historico": [],            # {quando, acao, detalhe}
     "chat": [],
     "rascunho_ia": None,        # fluxo gerado pela IA aguardando confirmação
+    "afiliado": {"link": "", "produto": "Meus Agentes · Super Agente IA", "preco": "14,90",
+                 "condicoes": "pagamento único, acesso vitalício, sem mensalidade",
+                 "descricao": "18 agentes de inteligência artificial, um para cada área da vida (treino, dieta, finanças, viagens, "
+                              "inglês, concursos, negócios, jurídico, mente, pets, esotérico e mais), com 3 bônus.",
+                 "estilo": "Próximo e animado"},
     "ver": 0,
 }
 for _k, _v in PADRAO.items():
     if _k not in st.session_state:
         st.session_state[_k] = json.loads(json.dumps(_v))
 S = st.session_state
-CHAVES_MEMORIA = ["rw", "n8n_url", "canais", "cred_ids", "automacoes", "historico", "chat"]
+CHAVES_MEMORIA = ["rw", "n8n_url", "canais", "cred_ids", "automacoes", "historico", "chat", "afiliado"]
 
 
 def agora() -> str:
@@ -242,6 +248,10 @@ def rw(query: str, variaveis: dict = None, token: str = None) -> dict:
         if "not authorized" in msg.lower():
             raise ErroAPI("🔑 Este token não tem permissão para essa ação. Use um token da CONTA "
                           "(railway.com/account/tokens → Workspace: **No workspace**).")
+        if re.search(r"paused|upstream|outage|temporarily|try again later", msg, re.I):
+            raise ErroAPI("⏸️ O Railway pausou as implantações por um problema do lado deles (acompanhe em status.railway.com). "
+                          "Nada se perdeu: quando voltar ao normal, clique em ▶️ Continuar instalação. "
+                          f"(Mensagem do Railway: {msg})")
         raise ErroAPI(f"O Railway respondeu: {msg}")
     return dados.get("data") or {}
 
@@ -715,9 +725,9 @@ class Fluxo:
             cred = "whats"
         return self.http(nome, url, corpo, cred=cred, x=x, y=y, depois=depois, espacar=espacar)
 
-    def telegram(self, nome, texto_expr, x, y=300, depois=None):
+    def telegram(self, nome, texto_expr, x, y=300, depois=None, chat=None):
         return self.no(nome, "n8n-nodes-base.telegram", 1.2,
-                       {"chatId": S.canais["tg_chat"], "text": "={{ String(" + texto_expr + ").slice(0, 4000) }}",
+                       {"chatId": chat or S.canais["tg_chat"], "text": "={{ String(" + texto_expr + ").slice(0, 4000) }}",
                         "additionalFields": {"appendAttribution": False}},
                        x, y, cred={"telegramApi": cred_ref("telegram")}, continua=True, depois=depois)
 
@@ -1079,11 +1089,174 @@ def m_recuperacao(cfg):
                        "instrucao": "Cole este endereço na plataforma marcando os eventos de carrinho abandonado, boleto e Pix gerado."}
 
 
+
+# ── DIVULGAR LINK DE AFILIADO ─────────────────────────────────────────────
+def dados_afi() -> dict:
+    a = S.get("afiliado") or {}
+    if not (a.get("link") or "").strip():
+        raise ErroAPI("Cole primeiro o seu link de afiliado na aba 💸 Divulgar meu link.")
+    return a
+
+
+def ctx_afi(a: dict) -> str:
+    return (f"PRODUTO: {a.get('produto')}. PREÇO: R$ {a.get('preco')} ({a.get('condicoes')}). O QUE É: {a.get('descricao')} "
+            f"LINK: {a.get('link')}. Quem divulga: {S.u_nome}. Estilo: {a.get('estilo')}.")
+
+
+REGRAS_DIVULG = ("Escreva em português do Brasil, como uma pessoa real, sem markdown, sem asteriscos, sem aspas. "
+                 "Nunca prometa ganhos nem invente preço, bônus ou garantia. Use só as informações do produto. Emojis com moderação.")
+CORES_STATUS = ["#7C3AED", "#16A34A", "#E11D63", "#0EA5E9", "#F59E0B", "#0F766E"]
+
+
+def m_afi_status(cfg):
+    a = dados_afi()
+    f = Fluxo(cfg["nome"])
+    f.agenda("Horário do Status", cfg["hora"], cfg["dias"])
+    sistema = ("Você cria textos curtos para o Status do WhatsApp de quem indica um produto. " + REGRAS_DIVULG +
+               " Até 220 caracteres. Varie todo dia o ângulo: curiosidade, uso real, pergunta, benefício, oferta, bônus. "
+               "Termine com o link quando couber. Responda só com o texto do Status.")
+    f.ia("IA cria o Status", sistema, js(ctx_afi(a) + " Crie o Status de hoje.") + " + ' Data: ' + $now.toFormat('dd/MM/yyyy')",
+         260, depois="Horário do Status", temperatura=0.95)
+    canais = {"groq"}
+    c = S.canais
+    if c.get("whats_prov") == "evolution" and canal_pronto("whats"):
+        cores = json.dumps(CORES_STATUS)
+        corpo = (f"{{ type: 'text', content: String({RESPOSTA_IA}).slice(0, 650), backgroundColor: {cores}[$now.day % {len(CORES_STATUS)}], "
+                 "font: 1, allContacts: true }")
+        ult = f.http("Postar no Status", f"{c['whats_base'].rstrip('/')}/message/sendStatus/{c['whats_inst']}", corpo, cred="whats", x=520,
+                     depois="IA cria o Status")
+        canais.add("whats")
+        if cfg["avisar"] != "nenhum":
+            f.avisar(cfg["avisar"], "Avisar você", "'✅ Status de hoje postado:\\n\\n' + " + f"{D('IA cria o Status')}.choices[0].message.content",
+                     780, depois=ult, assunto="'✅ Status postado'")
+            canais.add(cfg["avisar"])
+        instr = "Todo dia marcado o robô posta um Status novo no seu WhatsApp (Evolution API)."
+    else:
+        dest = cfg["avisar"] if cfg["avisar"] != "nenhum" else ("telegram" if canal_pronto("telegram") else "email")
+        f.avisar(dest, "Enviar o Status para você", "'📲 Seu Status de hoje (copie e poste):\\n\\n' + " + RESPOSTA_IA, 520,
+                 depois="IA cria o Status", assunto="'📲 Seu Status de hoje'")
+        canais.add(dest)
+        instr = (f"Seu WhatsApp não é Evolution API, então todo dia o robô manda o Status pronto {_destino_txt(dest)} "
+                 "para você copiar e postar em 10 segundos.")
+    return f, canais, {"tipo": "agenda", "instrucao": instr}
+
+
+def m_afi_captura(cfg):
+    a = dados_afi()
+    f = Fluxo(cfg["nome"])
+    campos = [("Nome", "text", True), ("WhatsApp (com DDD)", "text", True), ("O que mais te interessa?", "textarea", False)]
+    f.formulario("Formulário", cfg["titulo"], cfg.get("descricao", ""), campos, cfg["path"], final=cfg.get("obrigado") or "Pronto! Confira seu WhatsApp. 😉")
+    f.codigo("Organizar lead", JS_LEAD, 260, depois="Formulário")
+    L = D("Organizar lead")
+    ult = f.whats("Mandar o link no WhatsApp", f"{L}.telefone",
+                  tpl_js(cfg["mensagem"].replace("{link}", a["link"]), {"nome": f"{L}.primeiro_nome"}), 520, depois="Organizar lead")
+    canais, x = {"whats"}, 780
+    f.codigo("Linha da planilha", "const l = $('Organizar lead').item.json; delete l.primeiro_nome; l.origem = 'Página de afiliado'; return [{ json: l }];",
+             x, depois=ult)
+    ult = f.tabela("Salvar na planilha", "{{TAB:leads}}", x + 260, depois="Linha da planilha")
+    x += 520
+    if cfg["avisar"] != "nenhum":
+        ult = f.avisar(cfg["avisar"], "Avisar você", f"'🎯 Novo interessado no seu link!\\nNome: ' + {L}.nome + '\\nWhatsApp: ' + {L}.telefone + '\\n' + {L}.interesse",
+                       x, depois=ult, assunto="'🎯 Novo interessado: ' + " + f"{L}.nome")
+        canais.add(cfg["avisar"])
+        x += 260
+    if cfg.get("lembrete") and cfg.get("msg_lembrete"):
+        f.esperar("Esperar", int(cfg["horas"]), "hours", x, depois=ult)
+        f.whats("Lembrete gentil", f"{L}.telefone", tpl_js(cfg["msg_lembrete"].replace("{link}", a["link"]), {"nome": f"{L}.primeiro_nome"}),
+                x + 260, depois="Esperar")
+    return f, canais, {"tipo": "form", "path": cfg["path"],
+                       "instrucao": "Coloque este link na bio do Instagram, no Status e nas mensagens: quem preencher recebe o seu link de afiliado na hora."}
+
+
+JS_FILTRO_INTERESSE = r"""
+// Só responde quem falou do produto (amigos e família não recebem resposta automática)
+const m = $('Ler mensagem').item.json;
+const palavras = __PALAVRAS__.map(p => p.toLowerCase().trim()).filter(Boolean);
+const t = String(m.texto || '').toLowerCase();
+if (!palavras.some(p => t.includes(p))) return [];
+return [{ json: m }];
+"""
+
+
+def m_afi_atendente(cfg):
+    a = dados_afi()
+    f = Fluxo(cfg["nome"])
+    palavras = [p.strip() for p in re.split(r"[,;\n]", cfg.get("palavras") or "") if p.strip()]
+    sistema = (f"Você responde, pelo WhatsApp de {S.u_nome}, pessoas interessadas no produto que {S.u_nome} indica. " + REGRAS_DIVULG +
+               f" Informações: {ctx_afi(a)} Responda curto (até 4 frases), tire a dúvida e, quando a pessoa mostrar interesse, "
+               f"mande o link {a['link']}. Se não souber, diga que {S.u_nome} vai responder pessoalmente.")
+    f.webhook("Mensagem recebida", cfg["path"])
+    f.codigo("Ler mensagem", JS_LER_WHATS, 260, depois="Mensagem recebida")
+    f.codigo("Só quem falou do produto", JS_FILTRO_INTERESSE.replace("__PALAVRAS__", json.dumps(palavras, ensure_ascii=False)), 520, depois="Ler mensagem")
+    f.ia("IA responde", sistema, f"'Pessoa: ' + ({D('Ler mensagem')}.nome || 'sem nome') + '\\nMensagem: ' + {D('Ler mensagem')}.texto", 780,
+         depois="Só quem falou do produto")
+    f.whats("Responder no WhatsApp", f"{D('Ler mensagem')}.numero", RESPOSTA_IA, 1040, depois="IA responde")
+    return f, {"groq", "whats"}, {"tipo": "webhook", "path": cfg["path"],
+                                  "instrucao": "Cole este endereço no Webhook da sua Evolution API/Z-API. O robô só responde mensagens que "
+                                               "falam do produto (pelas palavras que você escolheu); o resto continua com você."}
+
+
+def m_afi_post(cfg):
+    a = dados_afi()
+    pagina = (cfg.get("pagina_id") or "").strip() and (cfg.get("pagina_token") or "").strip()
+    canal = (cfg.get("tg_canal") or "").strip()
+    if not pagina and not canal:
+        raise ErroAPI("Preencha a Página do Facebook (ID e token) e/ou o canal/grupo do Telegram.")
+    f = Fluxo(cfg["nome"])
+    f.agenda("Horário do post", cfg["hora"], cfg["dias"])
+    sistema = ("Você escreve posts de divulgação para quem indica um produto. " + REGRAS_DIVULG +
+               " Post com gancho na primeira linha, 2 ou 3 benefícios concretos, chamada para ação com o link e 3 a 5 hashtags. "
+               "Varie o ângulo a cada dia. Responda só com o post.")
+    f.ia("IA cria o post", sistema, js(ctx_afi(a)) + " + ' Data: ' + $now.toFormat('dd/MM/yyyy')", 260, depois="Horário do post", temperatura=0.95)
+    ult, x, canais = "IA cria o post", 520, {"groq"}
+    if pagina:
+        ult = f.http("Publicar na Página", f"https://graph.facebook.com/v21.0/{cfg['pagina_id'].strip()}/feed", None, None, x, depois=ult,
+                     query={"message": "={{ " + f"{D('IA cria o post')}.choices[0].message.content" + " }}", "access_token": cfg["pagina_token"].strip()})
+        x += 260
+    if canal:
+        if not canal_pronto("telegram") and not S.segredos.get("tg_token"):
+            raise ErroAPI("Para postar no Telegram, configure o robô do Telegram na aba 🔌 Canais e coloque o robô como administrador do canal.")
+        f.telegram("Postar no Telegram", f"{D('IA cria o post')}.choices[0].message.content", x, depois=ult, chat=canal)
+        canais.add("telegram")
+    return f, canais, {"tipo": "agenda", "instrucao": "Publica sozinho nos dias e horário marcados, sempre com o seu link."}
+
+
+def m_afi_relatorio(cfg):
+    return m_relatorio(dict(cfg, tabela="leads"))
+
 DEST = ["whats", "telegram", "email", "nenhum"]
 NOME_DEST = {"whats": "💬 Meu WhatsApp", "telegram": "✈️ Meu Telegram", "email": "📧 Meu e-mail", "nenhum": "🚫 Não avisar"}
 TONS = ["Simpático e acolhedor", "Profissional e objetivo", "Divertido e descontraído", "Premium e elegante"]
 
 MODELOS = {
+    "afi_status": {"cat": "afiliado", "titulo": "📲 Status do WhatsApp todo dia", "fn": m_afi_status,
+                   "desc": "A IA cria um Status novo por dia com o seu link. Com Evolution API o robô posta sozinho; com outros serviços ele te manda pronto para copiar.",
+                   "campos": [("dias", "Dias", "dias", DIAS_SEMANA), ("hora", "Horário", "hora", "08:00"),
+                              ("avisar", "Avisar / mandar para você em", "destino", "telegram")]},
+    "afi_captura": {"cat": "afiliado", "titulo": "🧲 Página “Quero saber mais” + link automático", "fn": m_afi_captura,
+                    "desc": "Um formulário para a bio e o Status. Quem preencher recebe na hora o seu link no WhatsApp, entra na sua planilha e, se quiser, ganha um lembrete gentil depois.",
+                    "campos": [("titulo", "Título do formulário", "texto", "Quero conhecer os 18 agentes de IA"),
+                               ("descricao", "Texto abaixo do título", "texto", "Deixe seu WhatsApp que eu te mando o link e as informações."),
+                               ("mensagem", "Mensagem com o link — use {nome} e {link}", "area",
+                                "Oi, {nome}! 😊 Aqui está o link que você pediu: {link}\nSão 18 agentes de IA por um pagamento único. Qualquer dúvida, me chama!"),
+                               ("obrigado", "Mensagem na tela depois de enviar", "texto", "Pronto! Confira seu WhatsApp. 😉"),
+                               ("lembrete", "Mandar UM lembrete gentil depois", "check", True), ("horas", "Depois de quantas horas", "numero", 24),
+                               ("msg_lembrete", "Lembrete — use {nome} e {link}", "area",
+                                "Oi, {nome}! Conseguiu dar uma olhada? Se ficou alguma dúvida, me fala. 😉 Link: {link} (se já garantiu, ignore!)"),
+                               ("avisar", "Avisar você em", "destino", "telegram")]},
+    "afi_atendente": {"cat": "afiliado", "titulo": "🤖 IA responde quem pergunta do produto", "fn": m_afi_atendente,
+                      "desc": "Quando alguém manda mensagem falando do produto, a IA tira as dúvidas e manda o seu link. Conversas pessoais não são respondidas.",
+                      "campos": [("palavras", "Palavras que ativam a resposta (separe por vírgula)", "area",
+                                  "agentes, meus agentes, link, quero, preço, valor, quanto custa, como funciona, bônus, robô")]},
+    "afi_post": {"cat": "afiliado", "titulo": "📘 Post automático no Facebook e Telegram", "fn": m_afi_post,
+                 "desc": "Publica sozinho na sua Página do Facebook e/ou no seu canal ou grupo do Telegram, sempre com o seu link.",
+                 "campos": [("dias", "Dias", "dias", ["Segunda", "Quarta", "Sexta"]), ("hora", "Horário", "hora", "12:00"),
+                            ("tg_canal", "Canal/grupo do Telegram (ex.: @meucanal) — opcional", "texto", ""),
+                            ("pagina_id", "ID da Página do Facebook — opcional", "texto", ""), ("pagina_token", "Token da Página — opcional", "senha", "")]},
+    "afi_relatorio": {"cat": "afiliado", "titulo": "📊 Relatório semanal dos interessados", "fn": m_afi_relatorio,
+                      "desc": "Toda semana a IA lê a planilha de interessados e te manda um resumo com o que funcionou e próximos passos.",
+                      "campos": [("dias", "Dias", "dias", ["Segunda"]), ("hora", "Horário", "hora", "08:00"),
+                                 ("avisar", "Enviar para", "destino_obrig", "telegram")]},
     "atendente": {"cat": "whats", "titulo": "🤖 Atendente IA 24h no WhatsApp", "fn": m_atendente,
                   "desc": "Responde sozinho cada mensagem que chega no seu WhatsApp, com as informações do seu negócio.",
                   "campos": [("negocio", "Nome do negócio", "texto", ""), ("info", "O que a IA precisa saber (produtos, preços, horário, endereço, regras)", "area", ""),
@@ -1154,6 +1327,8 @@ MODELOS = {
 }
 
 TESTES = {
+    "afi_atendente": lambda: {"event": "messages.upsert", "data": {"key": {"remoteJid": f"{(numeros_validos(S.canais.get('whats_dono', '')) or ['5511999999999'])[0]}@s.whatsapp.net",
+                              "fromMe": False}, "pushName": "Teste do n8n Fácil", "message": {"conversation": "Oi! Quanto custa os agentes? Como funciona?"}}},
     "atendente": lambda: {"event": "messages.upsert", "data": {"key": {"remoteJid": f"{re.sub(r'[^0-9]', '', S.canais.get('whats_dono', '')) or '5511999999999'}@s.whatsapp.net", "fromMe": False},
                                                                "pushName": "Teste do n8n Fácil", "message": {"conversation": "Olá! Qual o horário de atendimento?"}}},
     "venda": lambda: {"event": "PURCHASE_APPROVED", "data": {"product": {"name": "Produto Teste"}, "buyer": {"name": "Cliente Teste", "email": S.canais.get("email_para") or "teste@exemplo.com",
@@ -1589,15 +1764,26 @@ def memoria_json() -> bytes:
 # ══════════════════════════════════════════════════════════════════════════
 # GUIA PARA INICIANTES (rodapé e tela de entrada)
 # ══════════════════════════════════════════════════════════════════════════
+COMO_FUNCIONA = (
+    "✨ <b>Uma interface moderna que conversa direto com o Railway.</b> Você não precisa entender de servidor, Docker ou programação: "
+    "o n8n Fácil cria, configura, liga e cuida do seu n8n por você, com cliques e conversa.")
+PLANOS = (
+    "💳 <b>Planos de uso:</b> o servidor fica na <b>sua</b> conta do Railway e quem cobra é o próprio Railway — nada passa por nós. "
+    "Você pode <b>começar grátis</b> (teste de 30 dias com US$ 5 de crédito e, depois, o plano gratuito para uso leve). "
+    "Se usar muito, o plano Hobby é bem acessível: <b>a partir de US$ 5 por mês</b>. Valores atuais em railway.com/pricing.")
+
 GUIA = [
     ("🧰 O que é isso e o que você precisa", """
 **n8n** é um “robô de automações”: ele liga seus aplicativos (WhatsApp, e-mail, Hotmart, formulários, planilhas…) e faz tarefas sozinho, 24 horas.
 **Railway** é o lugar na internet onde o seu n8n fica ligado (um servidor só seu).
-Este agente faz a parte difícil por você: **instala, configura e cria as automações**.
+O **n8n Fácil** é uma **interface moderna que conversa direto com o Railway**: você não precisa entender nada de servidor.
+Ele **instala, configura, liga e cria as automações** por você.
 
 Você vai precisar de:
 - Uma **chave Groq** (grátis) para entrar no app.
-- Uma **conta no Railway** (railway.com). O Railway cobra pelo uso do servidor: confira o plano atual em **railway.com/pricing**.
+- Uma **conta no Railway** (railway.com). Os planos são do próprio Railway, cobrados direto na sua conta:
+  **comece grátis** (teste de 30 dias com US$ 5 de crédito e depois o plano gratuito para uso leve) e, se usar muito,
+  o plano Hobby custa **a partir de US$ 5 por mês**. Valores atuais em **railway.com/pricing**.
 - 15 minutos na primeira vez.
 """),
     ("🔑 Passo 1 — Criar a chave Groq (grátis)", """
@@ -1652,6 +1838,14 @@ Depois de criar, o app mostra o **endereço** que você precisa colar no outro s
 4. **Kiwify**: Apps → Webhooks → Criar → cole o endereço → marque *Compra aprovada* (ou *Carrinho abandonado*, *Boleto/Pix gerado*).
 5. **Monetizze**: Ferramentas → Postback → cole o endereço.
 6. Use **🧪 Testar** em **📋 Minhas automações** para simular uma venda.
+"""),
+    ("💸 Divulgar meu link de afiliado no automático", """
+Na aba **💸 Divulgar meu link**, cole o seu link de afiliado uma vez e ligue as automações que quiser:
+- **📲 Status todo dia:** a IA cria um Status novo com o seu link. Com a Evolution API o robô posta sozinho; com outros serviços ele te manda pronto para copiar.
+- **🧲 Página “Quero saber mais”:** coloque o link do formulário na bio. Quem preencher recebe o seu link no WhatsApp na hora (e um lembrete gentil depois, se você quiser).
+- **🤖 IA responde quem pergunta:** só responde mensagens que falam do produto (pelas palavras que você escolher). Conversas pessoais continuam com você.
+- **📘 Post no Facebook e Telegram** e **📊 relatório semanal** dos interessados.
+Não existe disparo em massa para a lista de contatos: é isso que protege o seu número.
 """),
     ("📋 Acompanhar, ligar, desligar e corrigir", """
 Na aba **📋 Minhas automações**: veja todas, **ligue/desligue**, **teste**, veja as **execuções** (✅ deu certo / ❌ deu erro, com o motivo),
@@ -1720,6 +1914,7 @@ if not S.u_chave:
         st.markdown(f"""<div class="card" style="font-size:.9em;line-height:1.7;">
         🔑 <b>Não tem chave?</b> Crie grátis em <a href="https://console.groq.com/keys" target="_blank">console.groq.com/keys</a>.<br>
         🚂 Você também vai precisar de uma conta em <a href="https://railway.com" target="_blank">railway.com</a> (veja o guia abaixo).<br>
+        {COMO_FUNCIONA}<br>{PLANOS}<br>
         🔒 Chaves, tokens e senhas ficam só nesta sessão do navegador.<br>
         🤖 Mais agentes em <a href="{SITE}" target="_blank">MeusAgentesIA.com.br</a>.</div>""", unsafe_allow_html=True)
     mostrar_guia()
@@ -1783,7 +1978,7 @@ with c_mem:
                 del S[k]
             st.rerun()
 
-abas = st.tabs(["🏠 Início", "🚀 Instalar n8n", "🔑 Conectar n8n", "🔌 Canais", "🧩 Criar automação", "📋 Minhas automações",
+abas = st.tabs(["🏠 Início", "🚀 Instalar n8n", "🔑 Conectar n8n", "🔌 Canais", "🧩 Criar automação", "💸 Divulgar meu link", "📋 Minhas automações",
                 "📊 Planilhas", "🛠️ Servidor", "💬 Assistente", "📑 Relatório"])
 V = S.ver
 
@@ -1817,6 +2012,7 @@ def bloco_token_railway(chave_widget: str):
 with abas[0]:
     R = S.rw
     tem_servidor = bool(R.get("domain") or S.n8n_url)
+    st.markdown(f'<div class="card" style="line-height:1.65">{COMO_FUNCIONA}<br>{PLANOS}</div>', unsafe_allow_html=True)
     etapas_ok = [
         ("Conta Railway conectada", bool(S.rw_token), "🚀 Instalar n8n → Passo 1"),
         ("n8n instalado no seu Railway", bool(R.get("feito", {}).get("ligar")) or bool(S.n8n_url), "🚀 Instalar n8n → Passo 2"),
@@ -2263,8 +2459,9 @@ with abas[4]:
                     cfg[ch] = alvo.selectbox(rot, TONS, index=TONS.index(pad), key=k)
                 elif tipo in ("destino", "destino_obrig"):
                     ops = DEST if tipo == "destino" else DEST[:3]
-                    cfg[ch] = alvo.selectbox(rot, ops, index=ops.index(pad), format_func=lambda d: NOME_DEST[d] + ("" if d == "nenhum" or canal_pronto(d) else " (configurar)"),
-                                             key=k)
+                    cfg[ch] = alvo.selectbox(rot, ops, index=ops.index(pad), format_func=lambda d: NOME_DEST[d], key=k)
+                    if cfg[ch] != "nenhum" and not canal_pronto(cfg[ch]):
+                        alvo.caption(f"⚠️ Configure {NOME_DEST[cfg[ch]]} na aba 🔌 Canais.")
                 elif tipo == "dias":
                     cfg[ch] = alvo.multiselect(rot, DIAS_SEMANA, default=pad, key=k)
                 elif tipo == "hora":
@@ -2383,6 +2580,89 @@ with abas[4]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 5b. DIVULGAR MEU LINK DE AFILIADO
+# ══════════════════════════════════════════════════════════════════════════
+def campos_modelo(chave: str, prefixo: str) -> dict:
+    m = MODELOS[chave]
+    cfg = {"nome": st.text_input("Nome da automação", value=m["titulo"].split(" ", 1)[1], key=f"{prefixo}_{chave}_nome_{V}")}
+    for ch, rot, tipo, pad in m["campos"]:
+        k = f"{prefixo}_{chave}_{ch}_{V}"
+        if tipo == "area":
+            cfg[ch] = st.text_area(rot, value=pad, key=k, height=100)
+        elif tipo == "check":
+            cfg[ch] = st.checkbox(rot, value=pad, key=k)
+        elif tipo in ("destino", "destino_obrig"):
+            ops = DEST if tipo == "destino" else DEST[:3]
+            cfg[ch] = st.selectbox(rot, ops, index=ops.index(pad), key=k, format_func=lambda d: NOME_DEST[d])
+            if cfg[ch] != "nenhum" and not canal_pronto(cfg[ch]):
+                st.caption(f"⚠️ Configure {NOME_DEST[cfg[ch]]} na aba 🔌 Canais.")
+        elif tipo == "dias":
+            cfg[ch] = st.multiselect(rot, DIAS_SEMANA, default=pad, key=k)
+        elif tipo == "hora":
+            cfg[ch] = st.time_input(rot, value=datetime.strptime(pad, "%H:%M").time(), key=k, step=900).strftime("%H:%M")
+        elif tipo == "numero":
+            cfg[ch] = st.number_input(rot, min_value=1, max_value=1000, value=int(pad), key=k)
+        elif tipo == "senha":
+            cfg[ch] = st.text_input(rot, type="password", key=k)
+        else:
+            cfg[ch] = st.text_input(rot, value=pad, key=k)
+    return cfg
+
+
+with abas[5]:
+    st.markdown("### 💸 Divulgar meu link de afiliado")
+    st.markdown("""<div class="card">Seu n8n vira um <b>robô de divulgação</b>: posta seu Status todo dia, entrega seu link para quem pede,
+    responde quem pergunta do produto, publica nas redes e te manda relatório. Tudo com o <b>seu link de afiliado</b>.</div>""", unsafe_allow_html=True)
+    st.markdown("""<div class="aviso">🛡️ <b>Seguro para o seu número:</b> estas automações só falam com quem pediu ou com quem já te segue.
+    Não existe disparo em massa para a lista de contatos — é isso que faz o WhatsApp bloquear números.</div>""", unsafe_allow_html=True)
+    A = S.setdefault("afiliado", json.loads(json.dumps(PADRAO["afiliado"])))
+    st.markdown("#### 1️⃣ Seu link e o produto")
+    A["link"] = st.text_input("Seu link de afiliado", value=A.get("link", ""), key=f"af_link_{V}", placeholder="cole aqui o seu link único").strip()
+    if A["link"] and not re.match(r"^https?://", A["link"]):
+        st.caption("⚠️ O link normalmente começa com https://")
+    with st.expander("⚙️ Dados do produto (já vêm preenchidos)"):
+        f1, f2 = st.columns([3, 1])
+        A["produto"] = f1.text_input("Produto", value=A.get("produto", ""), key=f"af_prod_{V}")
+        A["preco"] = f2.text_input("Preço (R$)", value=A.get("preco", ""), key=f"af_preco_{V}")
+        A["condicoes"] = st.text_input("Condições", value=A.get("condicoes", ""), key=f"af_cond_{V}")
+        A["descricao"] = st.text_area("Descrição", value=A.get("descricao", ""), key=f"af_desc_{V}", height=90)
+        estilos = ["Próximo e animado", "Profissional", "Divertido", "Direto ao ponto"]
+        A["estilo"] = st.selectbox("Seu jeito de falar", estilos, index=estilos.index(A["estilo"]) if A.get("estilo") in estilos else 0, key=f"af_est_{V}")
+    st.markdown("#### 2️⃣ Ligue as automações")
+    if not A["link"]:
+        st.info("👆 Cole o seu link de afiliado para liberar as automações.")
+    elif aviso_conexao():
+        ja = {a_.get("modelo") for a_ in S.automacoes}
+        for chave in [k for k, m_ in MODELOS.items() if m_["cat"] == "afiliado"]:
+            m_ = MODELOS[chave]
+            with st.expander(f"{'✅ ' if chave in ja else ''}{m_['titulo']}", expanded=False):
+                st.caption(m_["desc"])
+                if chave == "afi_status" and S.canais.get("whats_prov") != "evolution":
+                    st.caption("ℹ️ Postar no Status sozinho só funciona com a Evolution API. Com outro serviço, o robô te manda o Status pronto todo dia.")
+                if chave == "afi_post":
+                    st.caption("Telegram: crie um canal, adicione o seu robô (o da aba 🔌 Canais) como administrador e escreva o @ do canal.")
+                cfg = campos_modelo(chave, "af")
+                ativar = st.checkbox("Ligar assim que criar", value=True, key=f"af_{chave}_ativar_{V}")
+                if st.button("🚀 Ligar esta automação", type="primary", key=f"b_af_{chave}_{V}"):
+                    vazios = [rot for ch, rot, tipo, _ in m_["campos"] if tipo == "dias" and not cfg.get(ch)]
+                    if not cfg["nome"].strip():
+                        vazios.append("Nome da automação")
+                    if vazios:
+                        st.warning("Preencha: " + ", ".join(vazios))
+                    else:
+                        with st.spinner("Criando no seu n8n…"):
+                            r = rodar(criar_de_modelo, chave, cfg, ativar)
+                        if r:
+                            criado, info = r
+                            S["_ultimo_af"] = {"id": criado["id"], "nome": cfg["nome"], "ativa": criado.get("active"), "erro_ativar": criado.get("_erro_ativar"),
+                                               "url": url_gatilho(info), "gatilho": info.get("tipo"), "instrucao": info.get("instrucao"), "chave": chave}
+                if S.get("_ultimo_af", {}).get("chave") == chave:
+                    mostrar_resultado_criacao(S["_ultimo_af"])
+        st.markdown("""<div class="card">💡 <b>Combinação que mais funciona:</b> 📲 Status todo dia + 🧲 página “Quero saber mais” na bio
+        + 🤖 IA respondendo quem pergunta. Acompanhe os interessados na aba 📊 Planilhas (planilha “Leads e contatos”).</div>""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 6. MINHAS AUTOMAÇÕES
 # ══════════════════════════════════════════════════════════════════════════
 ST_EXEC = {"success": ("ok", "✅ Deu certo"), "error": ("atr", "❌ Erro"), "crashed": ("atr", "💥 Falhou"), "waiting": ("neu", "⏳ Esperando"),
@@ -2402,7 +2682,7 @@ def detalhe_execucao(eid: str) -> str:
     return "\n\n".join(linhas) or "Sem detalhes."
 
 
-with abas[5]:
+with abas[6]:
     st.markdown("### 📋 Minhas automações")
     if aviso_conexao():
         a1, a2 = st.columns([1, 3])
@@ -2487,7 +2767,7 @@ with abas[5]:
 # ══════════════════════════════════════════════════════════════════════════
 # 7. PLANILHAS
 # ══════════════════════════════════════════════════════════════════════════
-with abas[6]:
+with abas[7]:
     st.markdown("### 📊 Planilhas")
     st.caption("Leads, vendas e atendimentos que as automações guardam ficam em planilhas dentro do seu n8n (Data tables). Veja e baixe aqui.")
     if aviso_conexao():
@@ -2531,7 +2811,7 @@ with abas[6]:
 # ══════════════════════════════════════════════════════════════════════════
 SEGREDOS_VAR = ("KEY", "SECRET", "PASSWORD", "TOKEN")
 
-with abas[7]:
+with abas[8]:
     st.markdown("### 🛠️ Servidor")
     R = S.rw
     url_srv = S.n8n_url or (f"https://{R['domain']}" if R.get("domain") else "")
@@ -2687,7 +2967,7 @@ def executar_acao(a: dict) -> str:
     return "Não entendi essa ação."
 
 
-with abas[8]:
+with abas[9]:
     st.markdown("### 💬 Assistente")
     st.caption("Pergunte qualquer coisa sobre n8n, Railway e automações — ou peça: “liste minhas automações”, “desligue a de vendas”, "
                "“meu servidor está ligado?”, “crie uma automação que…”.")
@@ -2738,7 +3018,7 @@ with abas[8]:
 # ══════════════════════════════════════════════════════════════════════════
 # 10. RELATÓRIO
 # ══════════════════════════════════════════════════════════════════════════
-with abas[9]:
+with abas[10]:
     st.markdown("### 📑 Relatório e exportação")
     st.caption("Tudo o que foi feito: servidor, canais, automações e histórico. Tokens e senhas nunca aparecem.")
     marca = datetime.now().strftime("%Y%m%d_%H%M")
