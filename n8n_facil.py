@@ -18,6 +18,7 @@
 #   com o Streamlit: requests e pandas). Cada pessoa entra com o próprio
 #   nome e a própria chave Groq. Tokens e senhas ficam SÓ na sessão.
 # ════════════════════════════════════════════════════════════════════════
+import base64
 import hashlib
 import io
 import json
@@ -42,12 +43,13 @@ IMAGEM_N8N = "n8nio/n8n"
 PORTA_N8N = 5678
 PASTA_DADOS = "/home/node/.n8n"
 
+CATEGORIAS_EXTRA = {"agentes_wa": ("🤖", "Meus Agentes no WhatsApp")}
 CATEGORIAS = {
     "whats":   ("💬", "WhatsApp e atendimento"),
     "planilha": ("📊", "Planilhas e e-mail"),
     "conteudo": ("📣", "Redes sociais e conteúdo"),
     "vendas":  ("💰", "Vendas e pagamentos"),
-    "afiliado": ("💸", "Divulgar meu link de afiliado"),
+    "afiliado": ("💸", "Divulgar meu link de afiliado Meus Agentes IA"),
 }
 FUSOS = ["America/Sao_Paulo", "America/Manaus", "America/Cuiaba", "America/Belem", "America/Fortaleza", "America/Recife",
          "America/Bahia", "America/Porto_Velho", "America/Rio_Branco", "America/Noronha", "Europe/Lisbon", "UTC"]
@@ -118,6 +120,7 @@ PADRAO = {
     "historico": [],            # {quando, acao, detalhe}
     "chat": [],
     "rascunho_ia": None,        # fluxo gerado pela IA aguardando confirmação
+    "agentes_wa": {},
     "afiliado": {"link": "", "produto": "Meus Agentes · Super Agente IA", "preco": "14,90",
                  "condicoes": "pagamento único, acesso vitalício, sem mensalidade",
                  "descricao": "18 agentes de inteligência artificial, um para cada área da vida (treino, dieta, finanças, viagens, "
@@ -129,7 +132,7 @@ for _k, _v in PADRAO.items():
     if _k not in st.session_state:
         st.session_state[_k] = json.loads(json.dumps(_v))
 S = st.session_state
-CHAVES_MEMORIA = ["rw", "n8n_url", "canais", "cred_ids", "automacoes", "historico", "chat", "afiliado"]
+CHAVES_MEMORIA = ["rw", "n8n_url", "canais", "cred_ids", "automacoes", "historico", "chat", "afiliado", "agentes_wa"]
 
 
 def agora() -> str:
@@ -403,6 +406,185 @@ def instalar_etapa(chave: str, opc: dict):
             S.n8n_url = f"https://{R['domain']}"
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# PONTE DO WHATSAPP (Evolution API instalada no Railway da pessoa)
+# ══════════════════════════════════════════════════════════════════════════
+IMAGEM_EVO = "evoapicloud/evolution-api:v2.3.7"
+IMAGEM_PG = "ghcr.io/railwayapp-templates/postgres-ssl:17"
+INSTANCIA_EVO = "principal"
+NOME_PG, NOME_EVO = "evo-postgres", "evolution-api"
+
+
+def rw_criar_servico(nome: str, imagem: str) -> str:
+    s = rw("mutation($i: ServiceCreateInput!) { serviceCreate(input: $i) { id name } }",
+           {"i": {"projectId": S.rw["project_id"], "name": nome, "source": {"image": imagem}}})["serviceCreate"]
+    return s["id"]
+
+
+def rw_vars_servico(sid: str, vars_: dict, aplicar: bool = False):
+    R = S.rw
+    rw("mutation($i: VariableCollectionUpsertInput!) { variableCollectionUpsert(input: $i) }",
+       {"i": {"projectId": R["project_id"], "environmentId": R["env_id"], "serviceId": sid,
+              "variables": {k: str(v) for k, v in vars_.items()}, "skipDeploys": not aplicar}})
+
+
+def rw_volume_servico(sid: str, caminho: str) -> str:
+    v = rw("mutation($i: VolumeCreateInput!) { volumeCreate(input: $i) { id name } }",
+           {"i": {"projectId": S.rw["project_id"], "serviceId": sid, "environmentId": S.rw["env_id"], "mountPath": caminho}})["volumeCreate"]
+    return v["id"]
+
+
+def rw_dominio_servico(sid: str, porta: int) -> str:
+    d = rw("mutation($i: ServiceDomainCreateInput!) { serviceDomainCreate(input: $i) { id domain } }",
+           {"i": {"serviceId": sid, "environmentId": S.rw["env_id"], "targetPort": porta}})["serviceDomainCreate"]
+    return d["domain"]
+
+
+def rw_ligar_servico(sid: str):
+    v = {"s": sid, "e": S.rw["env_id"]}
+    try:
+        rw("mutation($s: String!, $e: String!) { serviceInstanceDeployV2(serviceId: $s, environmentId: $e) }", v)
+    except ErroAPI as e:
+        if "paus" in str(e).lower():
+            raise
+        rw("mutation($s: String!, $e: String!) { serviceInstanceRedeploy(serviceId: $s, environmentId: $e) }", v)
+
+
+ETAPAS_EVO = [
+    ("pg", "Criar o banco de dados da ponte (Postgres)"),
+    ("pg_cfg", "Configurar o banco de dados"),
+    ("pg_vol", "Criar o disco permanente do banco"),
+    ("evo", "Criar a ponte do WhatsApp (Evolution API)"),
+    ("evo_cfg", "Configurar a ponte e gerar a chave de segurança"),
+    ("evo_vol", "Criar o disco permanente da ponte"),
+    ("evo_dom", "Gerar o endereço público com https"),
+    ("ligar", "Ligar o banco e a ponte"),
+]
+
+
+def instalar_evo_etapa(chave: str):
+    E = S.rw.setdefault("evo", {})
+    if chave == "pg":
+        E["pg_id"] = rw_criar_servico(NOME_PG, IMAGEM_PG)
+    elif chave == "pg_cfg":
+        rw_vars_servico(E["pg_id"], {
+            "PGDATA": "/var/lib/postgresql/data/pgdata", "POSTGRES_DB": "evolution", "POSTGRES_USER": "evolution",
+            "POSTGRES_PASSWORD": secrets.token_hex(16),
+            "DATABASE_URL": "postgresql://${{ POSTGRES_USER }}:${{ POSTGRES_PASSWORD }}@${{ RAILWAY_PRIVATE_DOMAIN }}:5432/${{ POSTGRES_DB }}"})
+    elif chave == "pg_vol":
+        E["pg_vol"] = rw_volume_servico(E["pg_id"], "/var/lib/postgresql/data")
+    elif chave == "evo":
+        E["svc_id"] = rw_criar_servico(NOME_EVO, IMAGEM_EVO)
+    elif chave == "evo_cfg":
+        chave_api = secrets.token_hex(24)
+        rw_vars_servico(E["svc_id"], {
+            "SERVER_TYPE": "http", "SERVER_PORT": "8080", "PORT": "8080", "SERVER_URL": "https://${{ RAILWAY_PUBLIC_DOMAIN }}",
+            "AUTHENTICATION_API_KEY": chave_api, "AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES": "true",
+            "DATABASE_PROVIDER": "postgresql", "DATABASE_CONNECTION_URI": "${{ " + NOME_PG + ".DATABASE_URL }}",
+            "DATABASE_CONNECTION_CLIENT_NAME": "evolution", "DATABASE_SAVE_DATA_INSTANCE": "true",
+            "DATABASE_SAVE_DATA_NEW_MESSAGE": "false", "DATABASE_SAVE_MESSAGE_UPDATE": "false", "DATABASE_SAVE_DATA_CONTACTS": "false",
+            "DATABASE_SAVE_DATA_CHATS": "false", "DATABASE_SAVE_DATA_LABELS": "false", "DATABASE_SAVE_DATA_HISTORIC": "false",
+            "CACHE_REDIS_ENABLED": "false", "CACHE_LOCAL_ENABLED": "true", "TELEMETRY_ENABLED": "false",
+            "CONFIG_SESSION_PHONE_CLIENT": "n8n Facil", "CONFIG_SESSION_PHONE_NAME": "Chrome", "QRCODE_LIMIT": "30",
+            "DEL_INSTANCE": "false", "LANGUAGE": "en", "RAILWAY_RUN_UID": "0"})
+        S.segredos["whats_token"] = chave_api
+    elif chave == "evo_vol":
+        E["evo_vol"] = rw_volume_servico(E["svc_id"], "/evolution/instances")
+    elif chave == "evo_dom":
+        E["domain"] = rw_dominio_servico(E["svc_id"], 8080)
+    elif chave == "ligar":
+        rw_ligar_servico(E["pg_id"])
+        rw_ligar_servico(E["svc_id"])
+        E["instalada_em"] = agora()
+        usar_evo_instalada()
+
+
+def usar_evo_instalada():
+    """Preenche o canal WhatsApp com a ponte instalada pelo app."""
+    E = S.rw.get("evo") or {}
+    if E.get("domain"):
+        S.canais.update(whats_prov="evolution", whats_base=f"https://{E['domain']}", whats_inst=INSTANCIA_EVO)
+        S.ver += 1
+
+
+def evo_chave_do_railway() -> str:
+    E = S.rw.get("evo") or {}
+    R = S.rw
+    d = rw("query($p: String!, $e: String!, $s: String) { variables(projectId: $p, environmentId: $e, serviceId: $s) }",
+           {"p": R["project_id"], "e": R["env_id"], "s": E["svc_id"]})
+    chave = (d.get("variables") or {}).get("AUTHENTICATION_API_KEY", "")
+    if not chave:
+        raise ErroAPI("Não encontrei a chave da ponte no Railway.")
+    S.segredos["whats_token"] = chave
+    S.ver += 1
+    return chave
+
+
+def evo(metodo: str, caminho: str, corpo=None, params=None):
+    base = (S.canais.get("whats_base") or "").rstrip("/")
+    chave = S.segredos.get("whats_token") or ""
+    if not base or not chave:
+        raise ErroAPI("A ponte do WhatsApp ainda não está configurada.")
+    try:
+        r = requests.request(metodo, base + caminho, json=corpo, params=params, timeout=40, headers={"apikey": chave})
+    except requests.RequestException as e:
+        raise ErroAPI(f"Não consegui falar com a ponte do WhatsApp ({e.__class__.__name__}). Ela pode estar ligando: espere 2 minutos e tente de novo.")
+    if r.status_code in (502, 503, 504):
+        raise ErroAPI("⏳ A ponte do WhatsApp está ligando. Espere 1 ou 2 minutos e tente de novo.")
+    if r.status_code == 401:
+        raise ErroAPI("🔑 A ponte recusou a chave. Clique em “Buscar a chave no Railway”.")
+    try:
+        dados = r.json() if r.content else {}
+    except ValueError:
+        dados = {"texto": r.text[:200]}
+    if r.status_code >= 400:
+        msg = dados.get("response", {}).get("message") if isinstance(dados.get("response"), dict) else dados.get("message") or dados
+        raise ErroAPI(f"A ponte respondeu (código {r.status_code}): {msg}")
+    return dados
+
+
+def evo_estado() -> str:
+    try:
+        d = evo("GET", f"/instance/connectionState/{S.canais.get('whats_inst') or INSTANCIA_EVO}")
+    except ErroAPI as e:
+        if "404" in str(e) or "does not exist" in str(e):
+            return "sem_instancia"
+        raise
+    return ((d.get("instance") or {}).get("state")) or "close"
+
+
+def evo_garantir_instancia():
+    inst = S.canais.get("whats_inst") or INSTANCIA_EVO
+    try:
+        evo("POST", "/instance/create", {"instanceName": inst, "qrcode": False, "integration": "WHATSAPP-BAILEYS"})
+    except ErroAPI as e:
+        if not re.search(r"already|in use|existe|403", str(e), re.I):
+            raise
+
+
+def evo_qr(numero: str = "") -> dict:
+    """Devolve {'base64': 'data:image/png;base64,...', 'pairingCode': '...'} ou {'conectado': True}."""
+    evo_garantir_instancia()
+    inst = S.canais.get("whats_inst") or INSTANCIA_EVO
+    d = evo("GET", f"/instance/connect/{inst}", params={"number": numero} if numero else None)
+    if (d.get("instance") or {}).get("state") == "open":
+        return {"conectado": True}
+    if isinstance(d.get("qrcode"), dict):
+        d = d["qrcode"]
+    return {"base64": d.get("base64") or "", "pairingCode": d.get("pairingCode") or ""}
+
+
+def evo_ligar_webhook(url: str):
+    inst = S.canais.get("whats_inst") or INSTANCIA_EVO
+    evo("POST", f"/webhook/set/{inst}", {"webhook": {"enabled": True, "url": url, "byEvents": False, "base64": False,
+                                                     "events": ["MESSAGES_UPSERT"]}})
+
+
+def evo_e_nossa() -> bool:
+    E = S.rw.get("evo") or {}
+    return bool(E.get("domain")) and (S.canais.get("whats_base") or "").rstrip("/") == f"https://{E['domain']}"
+
+
 def n8n_online(url: str) -> bool:
     try:
         return requests.get(url.rstrip("/") + "/healthz", timeout=8).status_code == 200
@@ -568,6 +750,8 @@ TABELAS = {
                            ("nome", "string"), ("email", "string"), ("telefone", "string"), ("status", "string")]),
     "atendimentos": ("Atendimentos WhatsApp", [("data", "string"), ("numero", "string"), ("nome", "string"),
                                                ("mensagem", "string"), ("resposta", "string")]),
+    "agentes": ("Memória dos agentes", [("data", "string"), ("agente", "string"), ("tipo", "string"), ("conteudo", "string"),
+                                        ("valor", "string")]),
 }
 
 
@@ -702,9 +886,10 @@ class Fluxo:
         return self.no(nome, "n8n-nodes-base.httpRequest", 4.2, p, x, y, cred={"httpHeaderAuth": cred_ref(cred)} if cred else None,
                        continua=continua, depois=depois)
 
-    def ia(self, nome, sistema, usuario_expr, x, y=300, depois=None, temperatura=0.7):
-        corpo = ("{ model: '%s', temperature: %s, reasoning_effort: 'low', messages: [ { role: 'system', content: %s }, "
-                 "{ role: 'user', content: String(%s) } ] }") % (MODELO, temperatura, js(sistema), usuario_expr)
+    def ia(self, nome, sistema, usuario_expr, x, y=300, depois=None, temperatura=0.7, json_mode=False):
+        corpo = ("{ model: '%s', temperature: %s, reasoning_effort: 'low', %smessages: [ { role: 'system', content: %s }, "
+                 "{ role: 'user', content: String(%s) } ] }") % (MODELO, temperatura, "response_format: { type: 'json_object' }, " if json_mode else "",
+                                                                js(sistema), usuario_expr)
         return self.http(nome, GROQ_URL, corpo, cred="groq", x=x, y=y, depois=depois, continua=False)
 
     def whats(self, nome, numero_expr, texto_expr, x, y=300, depois=None, espacar=False):
@@ -1094,7 +1279,7 @@ def m_recuperacao(cfg):
 def dados_afi() -> dict:
     a = S.get("afiliado") or {}
     if not (a.get("link") or "").strip():
-        raise ErroAPI("Cole primeiro o seu link de afiliado na aba 💸 Divulgar meu link.")
+        raise ErroAPI("Cole primeiro o seu link de afiliado na aba 💸 Divulgar meu link de afiliado Meus Agentes IA.")
     return a
 
 
@@ -1223,6 +1408,225 @@ def m_afi_post(cfg):
 
 def m_afi_relatorio(cfg):
     return m_relatorio(dict(cfg, tabela="leads"))
+
+
+# ── MEUS AGENTES NO WHATSAPP ──────────────────────────────────────────────
+# chave: (emoji, nome, chamada, especialidade, o que registra, rotina padrão (hora, dias, pedido) ou None)
+AGENTES_WA = {
+    "viagens": ("🗺️", "Guia de Viagens", "viagem", "roteiros, destinos, orçamento de viagem, dicas e frases úteis em outros idiomas",
+                "planos e destinos desejados", ("10:00", ["Domingo"], "uma ideia de passeio ou viagem econômica para inspirar a semana")),
+    "nutri": ("🍽️", "NutriMind AI", "nutri", "alimentação saudável, calorias, receitas, lista de compras e hidratação (sem dietas extremas)",
+              "refeições com calorias estimadas e copos de água", ("12:00", DIAS_SEMANA, "lembrar de registrar o almoço e dizer como está o dia em calorias")),
+    "personal": ("💪", "Personal Trainer", "personal", "treinos em casa ou academia, alongamento e constância (com segurança)",
+                 "treinos feitos", ("07:00", ["Segunda", "Terça", "Quarta", "Quinta", "Sexta"], "o treino de hoje, curto e motivador, considerando os últimos treinos")),
+    "concursos": ("🎓", "Tutor Concursos", "concurso", "estudos para concursos, questões, revisão e plano de estudos",
+                  "horas de estudo e matérias", ("19:00", ["Segunda", "Terça", "Quarta", "Quinta", "Sexta"], "uma questão do dia de múltipla escolha, com a resposta no final")),
+    "ingles": ("🇺🇸", "Nexus English", "english", "inglês prático: frases, pronúncia escrita, correção de textos e mini desafios",
+               "palavras e frases aprendidas", ("09:00", DIAS_SEMANA, "a frase do dia em inglês com tradução e um mini desafio")),
+    "sherlock": ("🔍", "Sherlock IA", "sherlock", "análise de mensagens suspeitas, golpes, checagem de informações e raciocínio lógico",
+                 "golpes e alertas analisados", ("18:00", ["Quarta"], "um alerta curto sobre um golpe comum no Brasil e como se proteger")),
+    "financeiro": ("💰", "Oráculo Financeiro", "grana", "controle de gastos, orçamento, dívidas e reserva (educação financeira, sem prometer ganhos)",
+                   "gastos e receitas com valor em reais", ("21:00", DIAS_SEMANA, "o resumo dos gastos do dia e da semana, com um alerta se estiver alto")),
+    "presenca": ("⚡", "Presença IA", "presença", "confiança, comunicação, carisma e relacionamentos saudáveis",
+                 "situações e conquistas", ("08:00", ["Segunda", "Quarta", "Sexta"], "uma dica prática de comunicação e confiança para hoje")),
+    "invencoes": ("💡", "Invenções IA", "ideia", "criatividade, ideias de produtos, soluções e inovação",
+                  "ideias registradas", ("10:00", ["Sábado"], "um desafio criativo da semana")),
+    "nexus": ("🚀", "Nexus Launch", "negócio", "negócios, vendas, marketing, metas e lançamento de produtos",
+              "metas e tarefas do negócio", ("08:00", ["Segunda"], "o plano da semana para o negócio em 3 prioridades")),
+    "juridico": ("⚖️", "Consultor Jurídico", "jurídico", "orientação jurídica geral (consumidor, trabalho, família) — sem substituir advogado",
+                 "casos e prazos importantes", None),
+    "mente": ("🧠", "Mente Poderosa", "mente", "bem-estar emocional, ansiedade, foco e hábitos mentais (acolhimento, sem diagnóstico)",
+              "humor do dia de 0 a 10", ("21:30", DIAS_SEMANA, "um check-in gentil perguntando como foi o dia e o humor de 0 a 10")),
+    "pet": ("🐾", "Pet Inteligente", "pet", "cuidados com pets, alimentação, comportamento e lembretes de vacina (sem substituir veterinário)",
+            "vacinas, remédios e cuidados do pet", ("09:00", ["Sábado"], "uma dica de cuidado com o pet e um lembrete do que estiver pendente")),
+    "motos": ("🏍️", "Clássicas Motos IA", "moto", "motos clássicas, manutenção, história e dicas de pilotagem segura",
+              "manutenções da moto", ("09:00", ["Domingo"], "uma dica de manutenção ou curiosidade sobre motos clássicas")),
+    "classicos": ("🎬", "Clássicos IA", "clássico", "filmes, livros e músicas clássicas: indicações e curiosidades",
+                  "obras vistas e lidas", ("19:00", ["Sexta"], "uma indicação de clássico para o fim de semana, com uma curiosidade")),
+    "guardiao": ("🛡️", "Guardião Pessoal", "guardião", "segurança pessoal e digital, prevenção de golpes e proteção da família",
+                 "alertas e cuidados", ("19:00", ["Domingo"], "uma dica de segurança digital para a semana")),
+    "ravengar": ("🔮", "Tenda do Ravengar", "ravengar", "mensagens místicas, tarot, runas e numerologia como entretenimento e reflexão",
+                 "cartas e mensagens recebidas", ("07:30", DIAS_SEMANA, "a carta do dia com uma mensagem curta de reflexão")),
+    "vida": ("🧭", "Vida Inteligente", "vida", "metas, rotina, organização e equilíbrio entre as áreas da vida",
+             "metas e tarefas", ("21:00", ["Domingo"], "a revisão da semana e as 3 prioridades da próxima")),
+}
+MARCA_ROBO = "⁣"   # caractere invisível que marca as mensagens enviadas pelos agentes
+
+JS_LER_PROPRIO = r"""
+// Só aceita mensagens que VOCÊ escreveu no chat “Mensagem para você” (conversa consigo mesmo)
+const b = $json.body ?? $json;
+const d = b.data || {};
+const key = d.key || {};
+const dig = s => String(s || '').split('@')[0].split(':')[0].replace(/\D/g, '');
+const dono = dig(b.sender) || '__DONO__';
+const chats = [key.remoteJid, key.remoteJidAlt, key.senderPn, key.participant].map(dig).filter(Boolean);
+const m = d.message || {};
+const texto = String(m.conversation || (m.extendedTextMessage && m.extendedTextMessage.text) || '').trim();
+if (!key.fromMe || !texto) return [];
+if (!chats.includes(dono)) return [];                  // outras conversas: os agentes não se metem
+if (texto.includes('⁣')) return [];               // resposta dos próprios agentes
+if (/^\S{1,4} \*[^*\n]{2,40}\*\n/.test(texto)) return [];  // cabeçalho de agente (proteção extra)
+return [{ json: { texto, numero: dono } }];
+"""
+
+JS_CONTEXTO = r"""
+const msg = $('Ler mensagem').first().json;
+const linhas = $input.all().map(i => i.json).filter(l => l && l.agente);
+const mem = linhas.slice(0, 40).map(l => `${l.data} | ${l.agente} | ${l.tipo} | ${l.conteudo} | ${l.valor}`).join('\n');
+return [{ json: { prompt: 'Agora: ' + $now.setLocale('pt-BR').toFormat("cccc, dd/MM/yyyy HH:mm") + '\nMEMÓRIA (mais recentes primeiro):\n' + (mem || '(vazia)') + '\n\nMENSAGEM: ' + msg.texto } }];
+"""
+
+JS_SEPARAR = r"""
+const AG = __AGENTES__;
+let r = {};
+const bruto = String($json.choices[0].message.content || '');
+try { r = JSON.parse(bruto); } catch (e) { const m = bruto.match(/\{[\s\S]*\}/); try { r = JSON.parse(m ? m[0] : '{}'); } catch (e2) { r = { resposta: bruto }; } }
+const ag = AG[r.agente] || { emoji: '🤖', nome: 'Meus Agentes' };
+const texto = '⁣' + ag.emoji + ' *' + ag.nome + '*\n' + String(r.resposta || 'Não entendi. Escreva *menu* para ver os agentes.').trim();
+return [{ json: { texto, agente: r.agente || '', registro: (r.registro && typeof r.registro === 'object') ? r.registro : null } }];
+"""
+
+JS_LINHA_MEM = r"""
+const r = $('Separar resposta').first().json;
+if (!r.registro) return [];
+return [{ json: { data: $now.toFormat('dd/MM/yyyy HH:mm'), agente: r.agente, tipo: String(r.registro.tipo || ''),
+  conteudo: String(r.registro.conteudo || '').slice(0, 500), valor: String(r.registro.valor ?? '') } }];
+"""
+
+JS_CONTEXTO_ROTINA = r"""
+const linhas = $input.all().map(i => i.json).filter(l => l && l.agente);
+const mem = linhas.filter(l => l.agente === '__AG__').slice(0, 30).map(l => `${l.data} | ${l.tipo} | ${l.conteudo} | ${l.valor}`).join('\n');
+return [{ json: { prompt: 'Agora: ' + $now.setLocale('pt-BR').toFormat("cccc, dd/MM/yyyy HH:mm") + '\nMEMÓRIA deste agente (mais recentes primeiro):\n' + (mem || '(vazia)') } }];
+"""
+
+
+def regras_seguranca_agentes() -> str:
+    return ("Segurança: saúde e nutrição sem dietas extremas, jejuns longos ou exercícios perigosos (sugira profissional quando preciso); "
+            "finanças sem prometer ganhos; jurídico é orientação geral (indique advogado/Defensoria para casos reais); "
+            "emoções: acolha e, se houver sinais de risco, indique ajuda profissional e o CVV 188; esotérico é entretenimento e reflexão.")
+
+
+def no_memoria(f: "Fluxo", nome: str, x: int, depois: str):
+    f.no(nome, "n8n-nodes-base.dataTable", 1,
+         {"resource": "row", "operation": "get", "dataTableId": {"__rl": True, "mode": "id", "value": "{{TAB:agentes}}"},
+          "returnAll": False, "limit": 40, "orderBy": True, "orderByColumn": "createdAt", "orderByDirection": "DESC", "options": {}},
+         x, continua=True, depois=depois)
+    f.nodes[-1]["alwaysOutputData"] = True
+    return nome
+
+
+def fluxo_central_agentes(escolhidos: list, path: str) -> "Fluxo":
+    ag = {k: AGENTES_WA[k] for k in escolhidos}
+    lista = "\n".join(f"- {k}: {e} {n} (chamada '{c}:') — {esp}. Registra: {reg}." for k, (e, n, c, esp, reg, _) in ag.items())
+    sistema = (f"Você é a central dos agentes do Meus Agentes IA no WhatsApp de {S.u_nome}. Fale em português do Brasil. AGENTES DISPONÍVEIS:\n{lista}\n"
+               "REGRAS: 1) Se a mensagem começar com a chamada de um agente (ex.: 'nutri:'), responda como ele; senão escolha o agente mais adequado. "
+               "2) Responda curto (até 6 linhas), prático e caloroso, formatado para WhatsApp (pode usar *negrito* e listas com •). "
+               "3) Use a MEMÓRIA para personalizar e somar totais (ex.: calorias do dia, gastos da semana). Não invente registros. "
+               "4) Se a mensagem trouxer um fato para guardar (refeição, água, gasto, receita, treino, humor, estudo, meta, ideia, cuidado do pet, "
+               "manutenção…), devolva em 'registro'. 5) Se escreverem 'menu' ou 'ajuda', liste os agentes com emoji e chamada. "
+               f"6) {regras_seguranca_agentes()}\n"
+               "Responda SOMENTE em JSON: {\"agente\": \"chave\", \"resposta\": \"texto\", \"registro\": null ou "
+               "{\"tipo\": \"refeicao|agua|gasto|receita|treino|humor|estudo|meta|ideia|cuidado|outro\", \"conteudo\": \"descrição curta\", "
+               "\"valor\": \"número ou texto curto (ex.: 650 kcal, 45.90)\"}}")
+    f = Fluxo("🤖 Meus Agentes no WhatsApp — central")
+    f.webhook("Mensagem recebida", path)
+    dono = (numeros_validos(S.canais.get("whats_dono", "")) or [""])[0]
+    f.codigo("Ler mensagem", JS_LER_PROPRIO.replace("__DONO__", dono), 260, depois="Mensagem recebida")
+    no_memoria(f, "Memória", 520, "Ler mensagem")
+    f.codigo("Montar contexto", JS_CONTEXTO, 780, depois="Memória")
+    f.ia("Agentes respondem", sistema, "$json.prompt", 1040, depois="Montar contexto", temperatura=0.6, json_mode=True)
+    mapa = {k: {"emoji": e, "nome": n} for k, (e, n, *_r) in ag.items()}
+    f.codigo("Separar resposta", JS_SEPARAR.replace("__AGENTES__", json.dumps(mapa, ensure_ascii=False)), 1300, depois="Agentes respondem")
+    f.whats("Responder no WhatsApp", "$('Ler mensagem').first().json.numero", "$json.texto", 1560, depois="Separar resposta")
+    f.codigo("Linha da memória", JS_LINHA_MEM, 1820, depois="Responder no WhatsApp")
+    f.tabela("Guardar na memória", "{{TAB:agentes}}", 2080, depois="Linha da memória")
+    return f
+
+
+def fluxo_rotina_agente(chave: str, hora: str, dias: list) -> "Fluxo":
+    e, n, c, esp, reg, rot = AGENTES_WA[chave]
+    pedido = rot[2] if rot else "uma dica útil"
+    dono = (numeros_validos(S.canais.get("whats_dono", "")) or [""])[0]
+    sistema = (f"Você é {n} ({esp}), um dos agentes do Meus Agentes IA, mandando uma mensagem por conta própria no WhatsApp de {S.u_nome}. "
+               f"Escreva {pedido}. Curto (até 6 linhas), caloroso e prático, formatado para WhatsApp. Use a memória para personalizar, sem inventar registros. "
+               f"Termine lembrando que dá para responder começando com '{c}:'. {regras_seguranca_agentes()} Responda só com a mensagem.")
+    f = Fluxo(f"🤖 {n} — mensagem automática")
+    f.agenda("Horário", hora, dias)
+    no_memoria(f, "Memória", 260, "Horário")
+    f.codigo("Montar contexto", JS_CONTEXTO_ROTINA.replace("__AG__", chave), 520, depois="Memória")
+    f.ia("Agente escreve", sistema, "$json.prompt", 780, depois="Montar contexto", temperatura=0.85)
+    f.codigo("Formatar", "return [{ json: { texto: '\\u2063' + %s + ' *' + %s + '*\\n' + String($json.choices[0].message.content || '').trim() } }];"
+             % (js(e), js(n)), 1040, depois="Agente escreve")
+    f.whats("Enviar para você", js(dono), "$json.texto", 1300, depois="Formatar")
+    return f
+
+
+def requisitos_agentes() -> list:
+    faltas = []
+    if not conectado_n8n():
+        faltas.append("conectar o n8n (aba 🔑 Conectar n8n)")
+    if S.canais.get("whats_prov") != "evolution" or not canal_pronto("whats"):
+        faltas.append("conectar o WhatsApp pela ponte (aba 🔌 Canais → 📲 Ponte do WhatsApp)")
+    if not numeros_validos(S.canais.get("whats_dono", "")):
+        faltas.append("preencher o seu número em 🔌 Canais → 💬 WhatsApp (“Seu número para receber avisos”)")
+    return faltas
+
+
+def _remover_fluxo(wid: str):
+    try:
+        apagar_automacao(wid)
+    except ErroAPI:
+        pass
+
+
+def ligar_agentes_whatsapp(escolhidos: list, rotinas: dict) -> dict:
+    faltas = requisitos_agentes()
+    if faltas:
+        raise ErroAPI("Antes, falta: " + "; ".join(faltas) + ".")
+    if not escolhidos:
+        raise ErroAPI("Escolha pelo menos um agente.")
+    preparar_credenciais({"groq", "whats"})
+    antigo = S.get("agentes_wa") or {}
+    for wid in [antigo.get("central_id")] + list((antigo.get("rotinas") or {}).values()):
+        if wid:
+            _remover_fluxo(wid)
+    path = f"meus-agentes-{secrets.token_hex(3)}"
+    wf = trocar_tabelas(fluxo_central_agentes(escolhidos, path).json())
+    central = n8n("POST", "/workflows", wf)
+    n8n_ativar(central["id"], True)
+    url = url_gatilho({"tipo": "webhook", "path": path})
+    evo_ligar_webhook(url)
+    novo = {"central_id": central["id"], "url": url, "escolhidos": escolhidos, "rotinas": {}, "ligado_em": agora()}
+    S.automacoes.append({"id": central["id"], "nome": "Meus Agentes no WhatsApp — central", "categoria": "agentes_wa", "modelo": "agentes_central",
+                         "criada": agora(), "gatilho": "webhook", "url_gatilho": url, "instrucao": "Converse no chat “Mensagem para você” do WhatsApp."})
+    for k, (hora, dias) in rotinas.items():
+        if k not in escolhidos or not dias:
+            continue
+        wf_r = trocar_tabelas(fluxo_rotina_agente(k, hora, dias).json())
+        r = n8n("POST", "/workflows", wf_r)
+        n8n_ativar(r["id"], True)
+        novo["rotinas"][k] = r["id"]
+        S.automacoes.append({"id": r["id"], "nome": f"{AGENTES_WA[k][1]} — mensagem automática", "categoria": "agentes_wa", "modelo": "agentes_rotina",
+                             "criada": agora(), "gatilho": "agenda", "url_gatilho": "", "instrucao": f"{', '.join(dias)} às {hora}"})
+    S["agentes_wa"] = novo
+    registrar("Meus Agentes ligados no WhatsApp", f"{len(escolhidos)} agentes, {len(novo['rotinas'])} mensagens automáticas")
+    return novo
+
+
+def testar_agentes(texto: str) -> str:
+    a = S.get("agentes_wa") or {}
+    if not a.get("url"):
+        raise ErroAPI("Ligue os agentes primeiro.")
+    dono = (numeros_validos(S.canais.get("whats_dono", "")) or [""])[0]
+    corpo = {"event": "messages.upsert", "sender": f"{dono}@s.whatsapp.net",
+             "data": {"key": {"remoteJid": f"{dono}@s.whatsapp.net", "fromMe": True}, "message": {"conversation": texto}}}
+    try:
+        r = requests.post(a["url"], json=corpo, timeout=30)
+    except requests.RequestException as e:
+        raise ErroAPI(f"Não consegui enviar o teste ({e.__class__.__name__}).")
+    if r.status_code >= 400:
+        raise ErroAPI(f"O n8n respondeu com erro {r.status_code}. Veja em 📋 Minhas automações.")
+    return "Teste enviado! Em alguns segundos a resposta chega no seu WhatsApp, no chat “Mensagem para você”."
 
 DEST = ["whats", "telegram", "email", "nenhum"]
 NOME_DEST = {"whats": "💬 Meu WhatsApp", "telegram": "✈️ Meu Telegram", "email": "📧 Meu e-mail", "nenhum": "🚫 Não avisar"}
@@ -1586,6 +1990,14 @@ def criar_de_modelo(chave: str, cfg: dict, ativar: bool) -> tuple:
             criado["active"] = True
         except ErroAPI as e:
             criado["_erro_ativar"] = str(e)
+    if chave in ("atendente", "afi_atendente") and S.canais.get("whats_prov") == "evolution" and canal_pronto("whats"):
+        try:
+            evo_ligar_webhook(url_gatilho(info))
+            info = dict(info, instrucao="✅ Já liguei o seu WhatsApp a esta automação: as mensagens que chegarem vão direto para ela. "
+                                        "(Se você criar outro atendente, ele passa a receber no lugar deste.)")
+            registrar("WhatsApp ligado à automação", cfg["nome"])
+        except ErroAPI:
+            pass
     S.automacoes.append({"id": criado["id"], "nome": cfg["nome"], "categoria": m["cat"], "modelo": chave, "criada": agora(),
                          "gatilho": info.get("tipo"), "url_gatilho": url_gatilho(info), "instrucao": info.get("instrucao", "")})
     registrar("Automação criada", f"{cfg['nome']} (modelo {m['titulo']})")
@@ -1705,7 +2117,7 @@ def xlsx_bytes(abas: list) -> bytes:
 
 
 def nome_categoria(c: str) -> str:
-    e, n = CATEGORIAS.get(c, ("🧩", "Sob medida"))
+    e, n = CATEGORIAS.get(c) or CATEGORIAS_EXTRA.get(c) or ("🧩", "Sob medida")
     return f"{e} {n}"
 
 
@@ -1817,12 +2229,24 @@ Leva de **2 a 5 minutos** para ligar. Clique em **Verificar se já ligou** até 
 """),
     ("🔌 Passo 5 — Conectar seus canais", """
 Na aba **🔌 Canais** você conecta por onde as automações falam:
-- **💬 WhatsApp**: o n8n envia e recebe mensagens por uma “ponte”. Aceitamos **Evolution API** (você ou seu técnico instala; é só ler o QR Code),
-  **Z-API** (serviço pago brasileiro, mais simples) ou a **API oficial da Meta**. Cole o endereço, a instância e o token que o serviço te der.
+- **💬 WhatsApp**: o n8n fala com o WhatsApp por uma “ponte”. O jeito mais fácil: em **📲 Ponte do WhatsApp**, clique em
+  **Instalar a ponte no meu Railway** — o app instala tudo sozinho (grátis, no seu Railway) e depois você só lê o QR Code (veja o item “📱 Conectar seu WhatsApp”).
+  Se você já usa **Z-API** ou a **API oficial da Meta**, cole os dados em **💬 WhatsApp**.
 - **✈️ Telegram** (o jeito mais fácil de receber avisos): no Telegram fale com **@BotFather**, mande */newbot*, copie o token,
   mande um “oi” para o seu robô e clique em **Descobrir meu chat** no app.
 - **📧 E-mail**: no Gmail, ative a verificação em 2 etapas e crie uma **senha de app** em *myaccount.google.com/apppasswords*. Use essa senha (não a senha normal).
 Use **Testar** em cada canal antes de criar automações.
+"""),
+    ("📱 Conectar seu WhatsApp (passo a passo)", """
+1. Na aba **🔌 Canais**, abra **📲 Ponte do WhatsApp** e clique em **🚀 Instalar a ponte no meu Railway**. Espere todas as etapas ficarem ✅.
+2. Espere **2 a 4 minutos** (a ponte está ligando) e clique em **🔎 Verificar a ponte**.
+3. Clique em **📷 Mostrar o QR Code**.
+4. No celular: abra o **WhatsApp → ⋮ (ou Configurações) → Aparelhos conectados → Conectar um aparelho** e aponte a câmera para o QR Code.
+   O QR Code muda a cada ~40 segundos: se não der tempo, clique em **🔄 Novo QR Code**.
+5. **Sem como apontar a câmera?** (ex.: está no próprio celular) Use **🔢 Conectar com código**: digite seu número, clique e, no WhatsApp,
+   escolha **Conectar com número de telefone** e digite o código que aparecer.
+6. Quando aparecer **✅ WhatsApp conectado**, pronto! Use **🧪 Testar WhatsApp** para receber uma mensagem de teste.
+Seu WhatsApp continua funcionando normalmente no celular. Quando você criar um **atendente com IA**, o app liga a ponte a ele sozinho.
 """),
     ("🧩 Passo 6 — Criar automações", """
 Na aba **🧩 Criar automação** você tem 3 jeitos:
@@ -1839,13 +2263,21 @@ Depois de criar, o app mostra o **endereço** que você precisa colar no outro s
 5. **Monetizze**: Ferramentas → Postback → cole o endereço.
 6. Use **🧪 Testar** em **📋 Minhas automações** para simular uma venda.
 """),
-    ("💸 Divulgar meu link de afiliado no automático", """
-Na aba **💸 Divulgar meu link**, cole o seu link de afiliado uma vez e ligue as automações que quiser:
+    ("💸 Divulgar meu link de afiliado Meus Agentes IA no automático", """
+Na aba **💸 Divulgar meu link de afiliado Meus Agentes IA**, cole o seu link de afiliado uma vez e ligue as automações que quiser:
 - **📲 Status todo dia:** a IA cria um Status novo com o seu link. Com a Evolution API o robô posta sozinho; com outros serviços ele te manda pronto para copiar.
 - **🧲 Página “Quero saber mais”:** coloque o link do formulário na bio. Quem preencher recebe o seu link no WhatsApp na hora (e um lembrete gentil depois, se você quiser).
 - **🤖 IA responde quem pergunta:** só responde mensagens que falam do produto (pelas palavras que você escolher). Conversas pessoais continuam com você.
 - **📘 Post no Facebook e Telegram** e **📊 relatório semanal** dos interessados.
 Não existe disparo em massa para a lista de contatos: é isso que protege o seu número.
+"""),
+    ("🤖 Meus Agentes no WhatsApp", """
+Converse com os 18 agentes pelo seu WhatsApp, no chat **“Mensagem para você”** (procure seu próprio nome na lupa do WhatsApp).
+1. Conecte o WhatsApp pela **📲 Ponte do WhatsApp** (aba 🔌 Canais) e preencha **o seu número**.
+2. Na aba **🤖 Meus Agentes no WhatsApp**, escolha os agentes e, se quiser, os horários das mensagens automáticas.
+3. Clique em **🚀 Ligar meus agentes no WhatsApp** e use **🧪 Testar**.
+4. No WhatsApp, escreva **menu** ou chame direto: *nutri: almocei arroz e feijão*, *grana: gastei 45 no mercado*, *personal: treinei perna*.
+Os agentes lembram do que você conta (planilha “Memória dos agentes”) e só respondem nesse chat — as outras conversas continuam só suas.
 """),
     ("📋 Acompanhar, ligar, desligar e corrigir", """
 Na aba **📋 Minhas automações**: veja todas, **ligue/desligue**, **teste**, veja as **execuções** (✅ deu certo / ❌ deu erro, com o motivo),
@@ -1978,7 +2410,7 @@ with c_mem:
                 del S[k]
             st.rerun()
 
-abas = st.tabs(["🏠 Início", "🚀 Instalar n8n", "🔑 Conectar n8n", "🔌 Canais", "🧩 Criar automação", "💸 Divulgar meu link", "📋 Minhas automações",
+abas = st.tabs(["🏠 Início", "🚀 Instalar n8n", "🔑 Conectar n8n", "🔌 Canais", "🧩 Criar automação", "💸 Divulgar meu link de afiliado Meus Agentes IA", "🤖 Meus Agentes no WhatsApp", "📋 Minhas automações",
                 "📊 Planilhas", "🛠️ Servidor", "💬 Assistente", "📑 Relatório"])
 V = S.ver
 
@@ -2344,7 +2776,111 @@ with abas[3]:
     st.caption("Configure uma vez; todas as automações usam. Senhas e tokens ficam só nesta sessão e são guardados como credenciais seguras no SEU n8n.")
     st.markdown(f"**{NOME_CANAL['groq']}** — {chip('ok', '✅ pronta (sua chave de entrada)')}", unsafe_allow_html=True)
 
-    with st.expander(f"💬 WhatsApp — {'✅ configurado' if canal_pronto('whats') else '⬜ não configurado'}", expanded=not canal_pronto("whats")):
+    with st.expander("📲 Ponte do WhatsApp — instalar e conectar meu número (recomendado)",
+                     expanded=not canal_pronto("whats") or (evo_e_nossa() and S.get("_evo_estado") != "open")):
+        E = S.rw.setdefault("evo", {})
+        feito_evo = E.setdefault("feito", {})
+        st.markdown("O n8n fala com o WhatsApp por uma **ponte** (Evolution API). O app instala essa ponte **no seu Railway**, "
+                    "do lado do seu n8n, e você só lê o QR Code. **Não paga nada a mais** além do consumo do Railway.")
+        if not S.rw.get("project_id"):
+            st.info("👉 Primeiro instale o n8n na aba **🚀 Instalar n8n**: a ponte é instalada no mesmo projeto.")
+        elif not S.rw_token:
+            st.info("Por segurança o token do Railway não fica salvo. Cole de novo para continuar:")
+            bloco_token_railway("tok_evo")
+        elif not feito_evo.get("ligar"):
+            st.markdown("**O app vai fazer:**")
+            for k_, rot_ in ETAPAS_EVO:
+                st.markdown(f"{'✅' if feito_evo.get(k_) else '⬜'} {rot_}")
+            parcial_evo = any(feito_evo.values())
+            if st.button("▶️ Continuar instalação da ponte" if parcial_evo else "🚀 Instalar a ponte no meu Railway", type="primary", key="b_inst_evo"):
+                with st.status("Instalando a ponte do WhatsApp…", expanded=True) as stt:
+                    erro = None
+                    for k_, rot_ in ETAPAS_EVO:
+                        if feito_evo.get(k_):
+                            st.write(f"✅ {rot_} (já feito)")
+                            continue
+                        st.write(f"⏳ {rot_}…")
+                        try:
+                            instalar_evo_etapa(k_)
+                            feito_evo[k_] = True
+                            st.write(f"✅ {rot_}")
+                        except ErroAPI as e:
+                            erro = e
+                            st.write(f"❌ {rot_}")
+                            break
+                    if erro:
+                        stt.update(label="A instalação da ponte parou numa etapa", state="error")
+                    else:
+                        stt.update(label="Ponte instalada! Ligando…", state="complete")
+                        registrar("Ponte do WhatsApp instalada", f"https://{E.get('domain')}")
+                if erro:
+                    st.error(f"{erro}\n\nO que já foi feito ficou guardado: clique em **Continuar instalação da ponte**.")
+                else:
+                    st.rerun()
+        else:
+            if not evo_e_nossa():
+                st.caption("A ponte está instalada, mas o canal WhatsApp está usando outro serviço.")
+                if st.button("Usar a ponte instalada pelo app", key="b_usar_evo"):
+                    usar_evo_instalada()
+                    st.rerun()
+            elif not S.segredos.get("whats_token"):
+                st.info("Por segurança a chave da ponte não fica salva no arquivo. Busque no Railway (1 clique):")
+                if st.button("🔑 Buscar a chave no Railway", type="primary", key="b_chave_evo"):
+                    if rodar(evo_chave_do_railway):
+                        st.rerun()
+            else:
+                st.markdown(f"**Endereço da ponte:** `https://{E.get('domain')}`")
+                e1, e2 = st.columns(2)
+                if e1.button("🔎 Verificar a ponte", key="b_evo_estado", width="stretch"):
+                    with st.spinner("Conferindo…"):
+                        est = rodar(evo_estado)
+                    if est:
+                        S["_evo_estado"] = est
+                est = S.get("_evo_estado")
+                nomes_est = {"open": ("ok", "✅ WhatsApp conectado"), "connecting": ("neu", "⏳ Aguardando você ler o QR Code"),
+                             "close": ("fim", "📱 Ainda não conectado"), "sem_instancia": ("fim", "📱 Ainda não conectado")}
+                if est:
+                    cls_, txt_ = nomes_est.get(est, ("neu", est))
+                    e2.markdown(chip(cls_, txt_), unsafe_allow_html=True)
+                if est == "open":
+                    st.success("🎉 Seu WhatsApp está conectado à ponte. Use **🧪 Testar WhatsApp** logo abaixo para receber uma mensagem de teste.")
+                else:
+                    st.markdown("""**Como conectar:** no celular, abra o **WhatsApp → ⋮ (ou Configurações) → Aparelhos conectados →
+                    Conectar um aparelho** e aponte a câmera para o QR Code. Ele muda a cada ~40 segundos.""")
+                    q1, q2 = st.columns(2)
+                    if q1.button("📷 Mostrar o QR Code" if not S.get("_evo_qr") else "🔄 Novo QR Code", type="primary", key="b_evo_qr", width="stretch"):
+                        with st.spinner("Gerando o QR Code… (pode levar uns segundos)"):
+                            r_ = rodar(evo_qr)
+                        if r_:
+                            if r_.get("conectado"):
+                                S["_evo_estado"], S["_evo_qr"] = "open", None
+                                st.rerun()
+                            S["_evo_qr"] = r_.get("base64")
+                            if not S["_evo_qr"]:
+                                st.info("A ponte ainda está preparando o QR Code. Espere 10 segundos e clique de novo.")
+                    if S.get("_evo_qr"):
+                        try:
+                            q2.image(base64.b64decode(S["_evo_qr"].split(",", 1)[-1]), width=260, caption="Leia com o WhatsApp do celular")
+                        except Exception:
+                            q2.warning("Não consegui mostrar o QR Code. Clique em Novo QR Code.")
+                    with st.expander("🔢 Conectar com código (sem câmera)"):
+                        st.caption("No WhatsApp: Aparelhos conectados → Conectar um aparelho → **Conectar com número de telefone**.")
+                        num_ = st.text_input("Seu número com DDD", key=f"t_evo_num_{V}", placeholder="11 99999-9999")
+                        if st.button("Gerar código", key="b_evo_cod"):
+                            n_ = (numeros_validos(num_) or [""])[0]
+                            if not n_:
+                                st.warning("Digite o número com DDD.")
+                            else:
+                                with st.spinner("Gerando o código…"):
+                                    r_ = rodar(evo_qr, n_)
+                                if r_ and r_.get("pairingCode"):
+                                    st.markdown(f"### `{r_['pairingCode']}`")
+                                    st.caption("Digite este código no WhatsApp do celular. Depois clique em 🔎 Verificar a ponte.")
+                                elif r_:
+                                    st.info("A ponte ainda está preparando. Espere 10 segundos e clique de novo.")
+
+
+    with st.expander(f"💬 WhatsApp — {'✅ configurado' if canal_pronto('whats') else '⬜ não configurado'}", expanded=not canal_pronto("whats") and not S.rw.get("project_id")):
         provs = {"evolution": "Evolution API", "zapi": "Z-API", "meta": "API oficial da Meta (WhatsApp Cloud)"}
         prov = st.radio("Qual serviço você usa?", list(provs), format_func=lambda k: provs[k], horizontal=True,
                         index=list(provs).index(S.canais.get("whats_prov", "evolution")), key=f"c_prov_{V}")
@@ -2610,7 +3146,7 @@ def campos_modelo(chave: str, prefixo: str) -> dict:
 
 
 with abas[5]:
-    st.markdown("### 💸 Divulgar meu link de afiliado")
+    st.markdown("### 💸 Divulgar meu link de afiliado Meus Agentes IA")
     st.markdown("""<div class="card">Seu n8n vira um <b>robô de divulgação</b>: posta seu Status todo dia, entrega seu link para quem pede,
     responde quem pergunta do produto, publica nas redes e te manda relatório. Tudo com o <b>seu link de afiliado</b>.</div>""", unsafe_allow_html=True)
     st.markdown("""<div class="aviso">🛡️ <b>Seguro para o seu número:</b> estas automações só falam com quem pediu ou com quem já te segue.
@@ -2663,6 +3199,72 @@ with abas[5]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 5c. MEUS AGENTES NO WHATSAPP
+# ══════════════════════════════════════════════════════════════════════════
+with abas[6]:
+    st.markdown("### 🤖 Meus Agentes no WhatsApp")
+    st.markdown("""<div class="card">Converse com os <b>18 agentes do Meus Agentes IA</b> pelo seu próprio WhatsApp, no chat
+    <b>“Mensagem para você”</b> (a conversa com você mesmo). Eles <b>lembram de tudo</b> (refeições, gastos, treinos, humor, metas…)
+    e também <b>mandam mensagens sozinhos</b> nos horários que você escolher: treino do dia, lembrete do almoço, resumo dos gastos, carta do dia…</div>""",
+                unsafe_allow_html=True)
+    faltas_ag = requisitos_agentes()
+    if faltas_ag:
+        st.warning("Para ligar seus agentes, falta:\n\n" + "\n".join(f"- {x}" for x in faltas_ag))
+    AW = S.get("agentes_wa") or {}
+    st.markdown("#### 1️⃣ Escolha seus agentes")
+    todos = list(AGENTES_WA)
+    escolhidos = st.multiselect("Agentes", todos, default=AW.get("escolhidos") or todos, key=f"ms_ag_{V}",
+                                format_func=lambda k: f"{AGENTES_WA[k][0]} {AGENTES_WA[k][1]}")
+    st.markdown("#### 2️⃣ Mensagens automáticas (opcional)")
+    st.caption("Marque os agentes que devem puxar conversa sozinhos e ajuste o horário e os dias.")
+    rotinas = {}
+    with st.expander("⏰ Horários dos agentes", expanded=False):
+        for k in escolhidos:
+            e_, n_, c_, esp_, reg_, rot_ = AGENTES_WA[k]
+            if not rot_:
+                continue
+            r1, r2, r3 = st.columns([3, 1, 3])
+            on = r1.checkbox(f"{e_} {n_}: {rot_[2]}", value=k in (AW.get("rotinas") or {}) if AW else k in ("personal", "nutri", "financeiro", "ravengar"),
+                             key=f"cb_rot_{k}_{V}")
+            hh = r2.time_input("Hora", value=datetime.strptime(rot_[0], "%H:%M").time(), key=f"ti_rot_{k}_{V}", step=900, label_visibility="collapsed")
+            dd = r3.multiselect("Dias", DIAS_SEMANA, default=rot_[1], key=f"ms_rot_{k}_{V}", label_visibility="collapsed")
+            if on:
+                rotinas[k] = (hh.strftime("%H:%M"), dd)
+    st.markdown("#### 3️⃣ Ligar")
+    if AW.get("central_id"):
+        st.success(f"✅ Seus agentes estão ligados desde {AW.get('ligado_em')}: {len(AW.get('escolhidos', []))} agentes e "
+                   f"{len(AW.get('rotinas', {}))} mensagens automáticas. Para mudar, ajuste acima e clique em atualizar.")
+    if st.button("🔄 Atualizar meus agentes" if AW.get("central_id") else "🚀 Ligar meus agentes no WhatsApp", type="primary",
+                 key="b_ligar_agentes", disabled=bool(faltas_ag)):
+        with st.spinner("Ligando seus agentes… (cria a central e as mensagens automáticas no seu n8n)"):
+            res_ag = rodar(ligar_agentes_whatsapp, escolhidos, rotinas)
+        if res_ag:
+            st.balloons()
+            st.rerun()
+    if AW.get("central_id"):
+        t1, t2 = st.columns([3, 1])
+        txt_teste = t1.text_input("Teste agora (simula uma mensagem sua)", value="grana: gastei 45 no mercado", key=f"t_teste_ag_{V}")
+        if t2.button("🧪 Testar", key="b_testar_ag", width="stretch"):
+            r_ = rodar(testar_agentes, txt_teste)
+            if r_:
+                st.success(r_)
+    st.markdown("#### 📱 Como usar no WhatsApp")
+    exemplos = "".join(f"<li><b>{AGENTES_WA[k][2]}:</b> {x}</li>" for k, x in [
+        ("nutri", "almocei arroz, feijão, bife e salada"), ("financeiro", "gastei 45 no mercado"), ("personal", "treinei perna hoje"),
+        ("mente", "hoje estou ansioso, nota 4"), ("ingles", "como se diz ‘estou atrasado’?"), ("ravengar", "qual a minha carta de hoje?")] if k in AGENTES_WA)
+    st.markdown(f"""<div class="card"><ol style="margin:0;padding-left:20px;line-height:1.8">
+    <li>No WhatsApp, toque na lupa e procure o <b>seu próprio nome</b> (ou “Você”) — é o chat <b>“Mensagem para você”</b>.</li>
+    <li>Escreva <b>menu</b> para ver todos os agentes e como chamar cada um.</li>
+    <li>Chame pelo nome e dois-pontos, por exemplo:<ul>{exemplos}</ul></li>
+    <li>Sem chamada? Tudo bem: a IA escolhe o agente certo.</li></ol>
+    <p style="margin:8px 0 0">🔒 Os agentes <b>só respondem nesse chat</b>. Suas outras conversas continuam só suas.
+    Tudo o que eles registram fica na planilha <b>“Memória dos agentes”</b> (aba 📊 Planilhas).</p></div>""", unsafe_allow_html=True)
+    if AW.get("central_id"):
+        st.caption("ℹ️ O WhatsApp só envia as mensagens recebidas para UMA automação. Ligando os agentes, eles passam a receber no lugar do "
+                   "atendente IA deste número (se você tiver um). Para usar os dois, use números diferentes.")
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 6. MINHAS AUTOMAÇÕES
 # ══════════════════════════════════════════════════════════════════════════
 ST_EXEC = {"success": ("ok", "✅ Deu certo"), "error": ("atr", "❌ Erro"), "crashed": ("atr", "💥 Falhou"), "waiting": ("neu", "⏳ Esperando"),
@@ -2682,7 +3284,7 @@ def detalhe_execucao(eid: str) -> str:
     return "\n\n".join(linhas) or "Sem detalhes."
 
 
-with abas[6]:
+with abas[7]:
     st.markdown("### 📋 Minhas automações")
     if aviso_conexao():
         a1, a2 = st.columns([1, 3])
@@ -2767,7 +3369,7 @@ with abas[6]:
 # ══════════════════════════════════════════════════════════════════════════
 # 7. PLANILHAS
 # ══════════════════════════════════════════════════════════════════════════
-with abas[7]:
+with abas[8]:
     st.markdown("### 📊 Planilhas")
     st.caption("Leads, vendas e atendimentos que as automações guardam ficam em planilhas dentro do seu n8n (Data tables). Veja e baixe aqui.")
     if aviso_conexao():
@@ -2811,7 +3413,7 @@ with abas[7]:
 # ══════════════════════════════════════════════════════════════════════════
 SEGREDOS_VAR = ("KEY", "SECRET", "PASSWORD", "TOKEN")
 
-with abas[8]:
+with abas[9]:
     st.markdown("### 🛠️ Servidor")
     R = S.rw
     url_srv = S.n8n_url or (f"https://{R['domain']}" if R.get("domain") else "")
@@ -2967,7 +3569,7 @@ def executar_acao(a: dict) -> str:
     return "Não entendi essa ação."
 
 
-with abas[9]:
+with abas[10]:
     st.markdown("### 💬 Assistente")
     st.caption("Pergunte qualquer coisa sobre n8n, Railway e automações — ou peça: “liste minhas automações”, “desligue a de vendas”, "
                "“meu servidor está ligado?”, “crie uma automação que…”.")
@@ -3018,7 +3620,7 @@ with abas[9]:
 # ══════════════════════════════════════════════════════════════════════════
 # 10. RELATÓRIO
 # ══════════════════════════════════════════════════════════════════════════
-with abas[10]:
+with abas[11]:
     st.markdown("### 📑 Relatório e exportação")
     st.caption("Tudo o que foi feito: servidor, canais, automações e histórico. Tokens e senhas nunca aparecem.")
     marca = datetime.now().strftime("%Y%m%d_%H%M")
